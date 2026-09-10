@@ -12,7 +12,6 @@ import (
 
 var errUnreachable = errors.New("connection refused")
 
-// fakeRepo is an in-memory PollRepository for tests.
 type fakeRepo struct {
 	mu      sync.Mutex
 	polls   map[string]entity.Poll
@@ -29,16 +28,43 @@ func newFakeRepo() *fakeRepo {
 	}
 }
 
-func (r *fakeRepo) CreatePoll(_ context.Context, poll entity.Poll) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.polls[poll.ID] = poll
-	r.results[poll.ID] = map[string]int64{}
+type fakeTx struct {
+	repo *fakeRepo
+}
+
+func (r *fakeRepo) BeginTx(context.Context) (usecase.PollTx, error) {
+	return &fakeTx{repo: r}, nil
+}
+
+func (t *fakeTx) InsertPoll(_ context.Context, poll entity.Poll) error {
+	t.repo.mu.Lock()
+	defer t.repo.mu.Unlock()
+	t.repo.polls[poll.ID] = poll
+	t.repo.results[poll.ID] = map[string]int64{}
+	return nil
+}
+
+func (t *fakeTx) InsertPollOptions(_ context.Context, poll entity.Poll) error {
+	t.repo.mu.Lock()
+	defer t.repo.mu.Unlock()
+	t.repo.polls[poll.ID] = poll
+	return nil
+}
+
+func (t *fakeTx) InsertZeroResults(_ context.Context, poll entity.Poll) error {
+	t.repo.mu.Lock()
+	defer t.repo.mu.Unlock()
+	if t.repo.results[poll.ID] == nil {
+		t.repo.results[poll.ID] = map[string]int64{}
+	}
 	for _, option := range poll.Options {
-		r.results[poll.ID][option.ID] = 0
+		t.repo.results[poll.ID][option.ID] = 0
 	}
 	return nil
 }
+
+func (t *fakeTx) Commit(context.Context) error   { return nil }
+func (t *fakeTx) Rollback(context.Context) error { return nil }
 
 func (r *fakeRepo) GetPoll(_ context.Context, pollID string) (entity.Poll, error) {
 	r.mu.Lock()
@@ -50,7 +76,13 @@ func (r *fakeRepo) GetPoll(_ context.Context, pollID string) (entity.Poll, error
 	return poll, nil
 }
 
-func (r *fakeRepo) ListPolls(_ context.Context, limit, offset int) ([]entity.Poll, int, error) {
+func (r *fakeRepo) CountPolls(context.Context) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.polls), nil
+}
+
+func (r *fakeRepo) ListPollPage(_ context.Context, limit, offset int) ([]entity.Poll, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	all := make([]entity.Poll, 0, len(r.polls))
@@ -58,18 +90,30 @@ func (r *fakeRepo) ListPolls(_ context.Context, limit, offset int) ([]entity.Pol
 		all = append(all, poll)
 	}
 	if offset >= len(all) {
-		return nil, len(all), nil
+		return nil, nil
 	}
 	end := min(offset+limit, len(all))
-	return all[offset:end], len(all), nil
+	return all[offset:end], nil
 }
 
-func (r *fakeRepo) TransitionStatus(_ context.Context, pollID string, from []entity.PollStatus, to entity.PollStatus, at time.Time) (entity.Poll, error) {
+func (r *fakeRepo) ListOptionsByPollIDs(_ context.Context, pollIDs []string) (map[string][]entity.Option, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string][]entity.Option, len(pollIDs))
+	for _, id := range pollIDs {
+		if poll, ok := r.polls[id]; ok {
+			out[id] = poll.Options
+		}
+	}
+	return out, nil
+}
+
+func (r *fakeRepo) UpdatePollStatus(_ context.Context, pollID string, from []entity.PollStatus, to entity.PollStatus, at time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	poll, ok := r.polls[pollID]
 	if !ok {
-		return entity.Poll{}, entity.ErrPollNotFound()
+		return usecase.ErrNotUpdated
 	}
 	allowed := false
 	for _, status := range from {
@@ -79,8 +123,7 @@ func (r *fakeRepo) TransitionStatus(_ context.Context, pollID string, from []ent
 		}
 	}
 	if !allowed {
-		return entity.Poll{}, entity.NewError(entity.CodeConflict,
-			"cannot change poll status from "+string(poll.Status)+" to "+string(to))
+		return usecase.ErrNotUpdated
 	}
 	poll.Status = to
 	if to == entity.PollStatusFinished {
@@ -88,7 +131,17 @@ func (r *fakeRepo) TransitionStatus(_ context.Context, pollID string, from []ent
 		poll.FinishedAt = &finishedAt
 	}
 	r.polls[pollID] = poll
-	return poll, nil
+	return nil
+}
+
+func (r *fakeRepo) GetPollStatus(_ context.Context, pollID string) (entity.PollStatus, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	poll, ok := r.polls[pollID]
+	if !ok {
+		return "", entity.ErrPollNotFound()
+	}
+	return poll.Status, nil
 }
 
 func (r *fakeRepo) GetResults(_ context.Context, pollID string) (map[string]int64, error) {
@@ -123,7 +176,6 @@ func (r *fakeRepo) SaveResults(_ context.Context, pollID string, counts map[stri
 
 func (r *fakeRepo) Ping(context.Context) error { return nil }
 
-// fakeStore is an in-memory VoteStore for tests.
 type fakeStore struct {
 	mu       sync.Mutex
 	voted    map[string]struct{}
@@ -152,22 +204,22 @@ func (s *fakeStore) Guard(context.Context, usecase.GuardRequest) (usecase.Verdic
 	return s.verdict, nil
 }
 
-func (s *fakeStore) CastBallot(_ context.Context, ballot usecase.Ballot) (bool, error) {
+func (s *fakeStore) CastBallot(_ context.Context, ballot usecase.Ballot) error {
 	if s.failCastBallot {
-		return false, entity.WrapError(entity.CodeUnavailable, errUnreachable, "voting is temporarily unavailable")
+		return entity.WrapError(entity.CodeUnavailable, errUnreachable, "voting is temporarily unavailable")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	key := ballot.PollID + ":" + ballot.VoterHash
 	if _, seen := s.voted[key]; seen {
-		return false, nil
+		return entity.NewError(entity.CodeAlreadyVoted, "this device has already voted in this poll")
 	}
 	s.voted[key] = struct{}{}
 	for _, optionID := range ballot.OptionIDs {
 		s.counters[ballot.PollID+":"+optionID]++
 	}
-	return true, nil
+	return nil
 }
 
 func (s *fakeStore) Counters(_ context.Context, pollID string, optionIDs []string) (map[string]int64, error) {
@@ -216,7 +268,6 @@ func (s *fakeStore) isTracked(pollID string) bool {
 	return ok
 }
 
-// fixedLoader serves a fixed poll for vote tests.
 type fixedLoader struct {
 	poll entity.Poll
 	err  error
@@ -231,7 +282,6 @@ func (l fixedLoader) Poll(context.Context, string) (entity.Poll, error) {
 
 func (l fixedLoader) Invalidate(context.Context, string) error { return nil }
 
-// repoLoader reads polls through the fake repository.
 type repoLoader struct{ repo *fakeRepo }
 
 func (l repoLoader) Poll(ctx context.Context, pollID string) (entity.Poll, error) {

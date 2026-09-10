@@ -4,6 +4,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/LimeOnTop/voting-service/internal/entity"
@@ -28,27 +29,53 @@ func NewPollRepository(db *pgxpool.Pool) *PollRepository {
 }
 
 func (r *PollRepository) Ping(ctx context.Context) error {
-	return r.db.Ping(ctx)
+	if err := r.db.Ping(ctx); err != nil {
+		return fmt.Errorf("ping postgres: %w", err)
+	}
+	return nil
 }
 
-// CreatePoll inserts a poll, its options, and zeroed result rows.
-func (r *PollRepository) CreatePoll(ctx context.Context, poll entity.Poll) error {
+// BeginTx starts a write transaction.
+func (r *PollRepository) BeginTx(ctx context.Context) (usecase.PollTx, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
-		return entity.WrapError(entity.CodeUnavailable, err, "failed to create poll")
+		return nil, fmt.Errorf("begin tx: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to create poll"))
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	return &pollTx{tx: tx}, nil
+}
 
-	_, err = tx.Exec(ctx, `
+type pollTx struct {
+	tx pgx.Tx
+}
+
+func (t *pollTx) Commit(ctx context.Context) error {
+	if err := t.tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit tx: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to create poll"))
+	}
+	return nil
+}
+
+func (t *pollTx) Rollback(ctx context.Context) error {
+	if err := t.tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+		return fmt.Errorf("rollback tx: %w", err)
+	}
+	return nil
+}
+
+func (t *pollTx) InsertPoll(ctx context.Context, poll entity.Poll) error {
+	_, err := t.tx.Exec(ctx, `
 		INSERT INTO polls (id, question, type, max_choices, status, created_at, starts_at, ends_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 		poll.ID, poll.Question, string(poll.Type), poll.MaxChoices, string(poll.Status),
 		poll.CreatedAt, poll.StartsAt, poll.EndsAt)
 	if err != nil {
-		return entity.WrapError(entity.CodeUnavailable, err, "failed to create poll")
+		return fmt.Errorf("insert poll: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to create poll"))
 	}
+	return nil
+}
 
-	_, err = tx.CopyFrom(ctx,
+func (t *pollTx) InsertPollOptions(ctx context.Context, poll entity.Poll) error {
+	_, err := t.tx.CopyFrom(ctx,
 		pgx.Identifier{"poll_options"},
 		[]string{"id", "poll_id", "text", "position"},
 		pgx.CopyFromSlice(len(poll.Options), func(i int) ([]any, error) {
@@ -56,26 +83,25 @@ func (r *PollRepository) CreatePoll(ctx context.Context, poll entity.Poll) error
 			return []any{option.ID, poll.ID, option.Text, option.Position}, nil
 		}))
 	if err != nil {
-		return entity.WrapError(entity.CodeUnavailable, err, "failed to create poll options")
+		return fmt.Errorf("insert poll options: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to create poll options"))
 	}
+	return nil
+}
 
-	_, err = tx.CopyFrom(ctx,
+func (t *pollTx) InsertZeroResults(ctx context.Context, poll entity.Poll) error {
+	_, err := t.tx.CopyFrom(ctx,
 		pgx.Identifier{"poll_results"},
 		[]string{"poll_id", "option_id", "votes"},
 		pgx.CopyFromSlice(len(poll.Options), func(i int) ([]any, error) {
 			return []any{poll.ID, poll.Options[i].ID, int64(0)}, nil
 		}))
 	if err != nil {
-		return entity.WrapError(entity.CodeUnavailable, err, "failed to initialise poll results")
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return entity.WrapError(entity.CodeUnavailable, err, "failed to create poll")
+		return fmt.Errorf("insert poll results: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to initialise poll results"))
 	}
 	return nil
 }
 
-// GetPoll loads a poll with its options.
+// GetPoll loads a poll with its options in one JOIN query.
 func (r *PollRepository) GetPoll(ctx context.Context, pollID string) (entity.Poll, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT `+pollColumns+`, o.id, o.text, o.position
@@ -84,7 +110,7 @@ func (r *PollRepository) GetPoll(ctx context.Context, pollID string) (entity.Pol
 		WHERE p.id = $1
 		ORDER BY o.position, o.id`, pollID)
 	if err != nil {
-		return entity.Poll{}, entity.WrapError(entity.CodeUnavailable, err, "failed to load poll")
+		return entity.Poll{}, fmt.Errorf("get poll: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to load poll"))
 	}
 	defer rows.Close()
 
@@ -101,11 +127,10 @@ func (r *PollRepository) GetPoll(ctx context.Context, pollID string) (entity.Pol
 			optionText *string
 			position   *int
 		)
-		err := rows.Scan(&row.ID, &row.Question, &pollType, &row.MaxChoices, &status,
+		if err := rows.Scan(&row.ID, &row.Question, &pollType, &row.MaxChoices, &status,
 			&row.CreatedAt, &row.StartsAt, &row.EndsAt, &row.FinishedAt,
-			&optionID, &optionText, &position)
-		if err != nil {
-			return entity.Poll{}, entity.WrapError(entity.CodeUnavailable, err, "failed to load poll")
+			&optionID, &optionText, &position); err != nil {
+			return entity.Poll{}, fmt.Errorf("scan poll: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to load poll"))
 		}
 		if !found {
 			row.Type = entity.PollType(pollType)
@@ -118,7 +143,7 @@ func (r *PollRepository) GetPoll(ctx context.Context, pollID string) (entity.Pol
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return entity.Poll{}, entity.WrapError(entity.CodeUnavailable, err, "failed to load poll")
+		return entity.Poll{}, fmt.Errorf("iterate poll: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to load poll"))
 	}
 	if !found {
 		return entity.Poll{}, entity.ErrPollNotFound()
@@ -126,26 +151,28 @@ func (r *PollRepository) GetPoll(ctx context.Context, pollID string) (entity.Pol
 	return poll, nil
 }
 
-// ListPolls returns a page of polls with options, newest first.
-func (r *PollRepository) ListPolls(ctx context.Context, limit, offset int) ([]entity.Poll, int, error) {
+// CountPolls returns the total number of polls.
+func (r *PollRepository) CountPolls(ctx context.Context) (int, error) {
 	var total int
 	if err := r.db.QueryRow(ctx, `SELECT count(*) FROM polls`).Scan(&total); err != nil {
-		return nil, 0, entity.WrapError(entity.CodeUnavailable, err, "failed to count polls")
+		return 0, fmt.Errorf("count polls: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to count polls"))
 	}
+	return total, nil
+}
 
+// ListPollPage returns poll headers without options.
+func (r *PollRepository) ListPollPage(ctx context.Context, limit, offset int) ([]entity.Poll, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT `+pollColumns+`
 		FROM polls p
 		ORDER BY p.created_at DESC, p.id DESC
 		LIMIT $1 OFFSET $2`, limit, offset)
 	if err != nil {
-		return nil, 0, entity.WrapError(entity.CodeUnavailable, err, "failed to list polls")
+		return nil, fmt.Errorf("list polls: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to list polls"))
 	}
 	defer rows.Close()
 
 	polls := make([]entity.Poll, 0, limit)
-	index := make(map[string]int, limit)
-	ids := make([]string, 0, limit)
 	for rows.Next() {
 		var (
 			poll     entity.Poll
@@ -154,51 +181,53 @@ func (r *PollRepository) ListPolls(ctx context.Context, limit, offset int) ([]en
 		)
 		if err := rows.Scan(&poll.ID, &poll.Question, &pollType, &poll.MaxChoices, &status,
 			&poll.CreatedAt, &poll.StartsAt, &poll.EndsAt, &poll.FinishedAt); err != nil {
-			return nil, 0, entity.WrapError(entity.CodeUnavailable, err, "failed to list polls")
+			return nil, fmt.Errorf("scan poll page: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to list polls"))
 		}
 		poll.Type = entity.PollType(pollType)
 		poll.Status = entity.PollStatus(status)
-		index[poll.ID] = len(polls)
-		ids = append(ids, poll.ID)
 		polls = append(polls, poll)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, 0, entity.WrapError(entity.CodeUnavailable, err, "failed to list polls")
+		return nil, fmt.Errorf("iterate poll page: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to list polls"))
 	}
-	if len(ids) == 0 {
-		return polls, total, nil
+	return polls, nil
+}
+
+// ListOptionsByPollIDs loads options for the given polls.
+func (r *PollRepository) ListOptionsByPollIDs(ctx context.Context, pollIDs []string) (map[string][]entity.Option, error) {
+	out := make(map[string][]entity.Option, len(pollIDs))
+	if len(pollIDs) == 0 {
+		return out, nil
 	}
 
-	optionRows, err := r.db.Query(ctx, `
+	rows, err := r.db.Query(ctx, `
 		SELECT poll_id, id, text, position
 		FROM poll_options
 		WHERE poll_id = ANY($1::uuid[])
-		ORDER BY position, id`, ids)
+		ORDER BY position, id`, pollIDs)
 	if err != nil {
-		return nil, 0, entity.WrapError(entity.CodeUnavailable, err, "failed to load poll options")
+		return nil, fmt.Errorf("list options: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to load poll options"))
 	}
-	defer optionRows.Close()
+	defer rows.Close()
 
-	for optionRows.Next() {
+	for rows.Next() {
 		var (
 			pollID string
 			option entity.Option
 		)
-		if err := optionRows.Scan(&pollID, &option.ID, &option.Text, &option.Position); err != nil {
-			return nil, 0, entity.WrapError(entity.CodeUnavailable, err, "failed to load poll options")
+		if err := rows.Scan(&pollID, &option.ID, &option.Text, &option.Position); err != nil {
+			return nil, fmt.Errorf("scan options: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to load poll options"))
 		}
-		if position, ok := index[pollID]; ok {
-			polls[position].Options = append(polls[position].Options, option)
-		}
+		out[pollID] = append(out[pollID], option)
 	}
-	if err := optionRows.Err(); err != nil {
-		return nil, 0, entity.WrapError(entity.CodeUnavailable, err, "failed to load poll options")
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate options: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to load poll options"))
 	}
-	return polls, total, nil
+	return out, nil
 }
 
-// TransitionStatus updates poll status when the current status is allowed.
-func (r *PollRepository) TransitionStatus(ctx context.Context, pollID string, from []entity.PollStatus, to entity.PollStatus, at time.Time) (entity.Poll, error) {
+// UpdatePollStatus updates status when the current value is in from.
+func (r *PollRepository) UpdatePollStatus(ctx context.Context, pollID string, from []entity.PollStatus, to entity.PollStatus, at time.Time) error {
 	allowed := make([]string, len(from))
 	for i, status := range from {
 		allowed[i] = string(status)
@@ -216,25 +245,25 @@ func (r *PollRepository) TransitionStatus(ctx context.Context, pollID string, fr
 		WHERE id = $1 AND status = ANY($4::text[])
 		RETURNING id`, pollID, string(to), finishedAt, allowed).Scan(&updated)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return entity.Poll{}, r.explainFailedTransition(ctx, pollID, to)
+		return usecase.ErrNotUpdated
 	}
 	if err != nil {
-		return entity.Poll{}, entity.WrapError(entity.CodeUnavailable, err, "failed to update poll status")
+		return fmt.Errorf("update poll status: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to update poll status"))
 	}
-	return r.GetPoll(ctx, pollID)
+	return nil
 }
 
-func (r *PollRepository) explainFailedTransition(ctx context.Context, pollID string, to entity.PollStatus) error {
+// GetPollStatus returns the current lifecycle status of a poll.
+func (r *PollRepository) GetPollStatus(ctx context.Context, pollID string) (entity.PollStatus, error) {
 	var current string
 	err := r.db.QueryRow(ctx, `SELECT status FROM polls WHERE id = $1`, pollID).Scan(&current)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return entity.ErrPollNotFound()
+		return "", entity.ErrPollNotFound()
 	}
 	if err != nil {
-		return entity.WrapError(entity.CodeUnavailable, err, "failed to update poll status")
+		return "", fmt.Errorf("get poll status: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to load poll status"))
 	}
-	return entity.NewError(entity.CodeConflict,
-		"cannot change poll status from "+current+" to "+string(to))
+	return entity.PollStatus(current), nil
 }
 
 // GetResults returns durable vote counts for a poll.
@@ -242,7 +271,7 @@ func (r *PollRepository) GetResults(ctx context.Context, pollID string) (map[str
 	rows, err := r.db.Query(ctx, `
 		SELECT option_id, votes FROM poll_results WHERE poll_id = $1`, pollID)
 	if err != nil {
-		return nil, entity.WrapError(entity.CodeUnavailable, err, "failed to load results")
+		return nil, fmt.Errorf("get results: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to load results"))
 	}
 	defer rows.Close()
 
@@ -253,12 +282,12 @@ func (r *PollRepository) GetResults(ctx context.Context, pollID string) (map[str
 			votes    int64
 		)
 		if err := rows.Scan(&optionID, &votes); err != nil {
-			return nil, entity.WrapError(entity.CodeUnavailable, err, "failed to load results")
+			return nil, fmt.Errorf("scan results: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to load results"))
 		}
 		counts[optionID] = votes
 	}
 	if err := rows.Err(); err != nil {
-		return nil, entity.WrapError(entity.CodeUnavailable, err, "failed to load results")
+		return nil, fmt.Errorf("iterate results: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to load results"))
 	}
 	return counts, nil
 }
@@ -283,7 +312,7 @@ func (r *PollRepository) SaveResults(ctx context.Context, pollID string, counts 
 		SET votes = GREATEST(poll_results.votes, EXCLUDED.votes),
 		    updated_at = now()`, pollID, optionIDs, votes)
 	if err != nil {
-		return entity.WrapError(entity.CodeUnavailable, err, "failed to persist results")
+		return fmt.Errorf("save results: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to persist results"))
 	}
 	return nil
 }

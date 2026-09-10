@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -62,10 +64,26 @@ func NewPollService(repo usecase.PollRepository, store usecase.VoteStore, cache 
 func (s *PollService) Create(ctx context.Context, cmd CreatePollCommand) (entity.Poll, error) {
 	poll, err := s.buildPoll(cmd)
 	if err != nil {
-		return entity.Poll{}, err
+		return entity.Poll{}, fmt.Errorf("build poll: %w", err)
 	}
-	if err := s.repo.CreatePoll(ctx, poll); err != nil {
-		return entity.Poll{}, err
+
+	tx, err := s.repo.BeginTx(ctx)
+	if err != nil {
+		return entity.Poll{}, fmt.Errorf("create poll: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := tx.InsertPoll(ctx, poll); err != nil {
+		return entity.Poll{}, fmt.Errorf("create poll: %w", err)
+	}
+	if err := tx.InsertPollOptions(ctx, poll); err != nil {
+		return entity.Poll{}, fmt.Errorf("create poll: %w", err)
+	}
+	if err := tx.InsertZeroResults(ctx, poll); err != nil {
+		return entity.Poll{}, fmt.Errorf("create poll: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return entity.Poll{}, fmt.Errorf("create poll: %w", err)
 	}
 	return poll, nil
 }
@@ -153,7 +171,11 @@ func (s *PollService) Get(ctx context.Context, pollID string) (entity.Poll, erro
 	if uuid.Validate(pollID) != nil {
 		return entity.Poll{}, entity.ErrPollNotFound()
 	}
-	return s.cache.Poll(ctx, pollID)
+	poll, err := s.cache.Poll(ctx, pollID)
+	if err != nil {
+		return entity.Poll{}, fmt.Errorf("get poll: %w", err)
+	}
+	return poll, nil
 }
 
 // PollPage is one page of the admin poll list.
@@ -175,9 +197,25 @@ func (s *PollService) List(ctx context.Context, limit, offset int) (PollPage, er
 	if offset < 0 {
 		offset = 0
 	}
-	polls, total, err := s.repo.ListPolls(ctx, limit, offset)
+
+	total, err := s.repo.CountPolls(ctx)
 	if err != nil {
-		return PollPage{}, err
+		return PollPage{}, fmt.Errorf("list polls: %w", err)
+	}
+	polls, err := s.repo.ListPollPage(ctx, limit, offset)
+	if err != nil {
+		return PollPage{}, fmt.Errorf("list polls: %w", err)
+	}
+	ids := make([]string, len(polls))
+	for i, poll := range polls {
+		ids[i] = poll.ID
+	}
+	optionsByPoll, err := s.repo.ListOptionsByPollIDs(ctx, ids)
+	if err != nil {
+		return PollPage{}, fmt.Errorf("list polls: %w", err)
+	}
+	for i := range polls {
+		polls[i].Options = optionsByPoll[polls[i].ID]
 	}
 	return PollPage{Items: polls, Total: total, Limit: limit, Offset: offset}, nil
 }
@@ -186,12 +224,15 @@ func (s *PollService) List(ctx context.Context, limit, offset int) (PollPage, er
 func (s *PollService) Activate(ctx context.Context, pollID string) (entity.Poll, error) {
 	poll, err := s.transition(ctx, pollID, []entity.PollStatus{entity.PollStatusDraft}, entity.PollStatusActive)
 	if err != nil {
-		return entity.Poll{}, err
+		return entity.Poll{}, fmt.Errorf("activate poll: %w", err)
 	}
 	if err := s.store.TrackPoll(ctx, poll.ID); err != nil {
-		return entity.Poll{}, err
+		return entity.Poll{}, fmt.Errorf("activate poll: %w", err)
 	}
-	return poll, s.invalidate(ctx, poll.ID)
+	if err := s.invalidate(ctx, poll.ID); err != nil {
+		return entity.Poll{}, fmt.Errorf("activate poll: %w", err)
+	}
+	return poll, nil
 }
 
 // Finish closes a poll.
@@ -199,16 +240,35 @@ func (s *PollService) Finish(ctx context.Context, pollID string) (entity.Poll, e
 	poll, err := s.transition(ctx, pollID,
 		[]entity.PollStatus{entity.PollStatusDraft, entity.PollStatusActive}, entity.PollStatusFinished)
 	if err != nil {
-		return entity.Poll{}, err
+		return entity.Poll{}, fmt.Errorf("finish poll: %w", err)
 	}
-	return poll, s.invalidate(ctx, poll.ID)
+	if err := s.invalidate(ctx, poll.ID); err != nil {
+		return entity.Poll{}, fmt.Errorf("finish poll: %w", err)
+	}
+	return poll, nil
 }
 
 func (s *PollService) transition(ctx context.Context, pollID string, from []entity.PollStatus, to entity.PollStatus) (entity.Poll, error) {
 	if uuid.Validate(pollID) != nil {
 		return entity.Poll{}, entity.ErrPollNotFound()
 	}
-	return s.repo.TransitionStatus(ctx, pollID, from, to, s.now().UTC())
+	err := s.repo.UpdatePollStatus(ctx, pollID, from, to, s.now().UTC())
+	if errors.Is(err, usecase.ErrNotUpdated) {
+		current, statusErr := s.repo.GetPollStatus(ctx, pollID)
+		if statusErr != nil {
+			return entity.Poll{}, fmt.Errorf("transition poll: %w", statusErr)
+		}
+		return entity.Poll{}, entity.NewError(entity.CodeConflict,
+			"cannot change poll status from "+string(current)+" to "+string(to))
+	}
+	if err != nil {
+		return entity.Poll{}, fmt.Errorf("transition poll: %w", err)
+	}
+	poll, err := s.repo.GetPoll(ctx, pollID)
+	if err != nil {
+		return entity.Poll{}, fmt.Errorf("transition poll: %w", err)
+	}
+	return poll, nil
 }
 
 func (s *PollService) invalidate(ctx context.Context, pollID string) error {
@@ -223,7 +283,7 @@ func (s *PollService) invalidate(ctx context.Context, pollID string) error {
 func (s *PollService) Results(ctx context.Context, pollID string) (Results, error) {
 	poll, err := s.Get(ctx, pollID)
 	if err != nil {
-		return Results{}, err
+		return Results{}, fmt.Errorf("results: %w", err)
 	}
 	optionIDs := poll.OptionIDs()
 
@@ -238,7 +298,7 @@ func (s *PollService) Results(ctx context.Context, pollID string) (Results, erro
 			"poll_id", pollID, "error", liveErr.Error())
 	}
 	if durableErr != nil && liveErr != nil {
-		return Results{}, entity.WrapError(entity.CodeUnavailable, liveErr, "results are temporarily unavailable")
+		return Results{}, fmt.Errorf("results: %w", entity.WrapError(entity.CodeUnavailable, liveErr, "results are temporarily unavailable"))
 	}
 
 	results := Results{Poll: poll, Counts: make(map[string]int64, len(optionIDs))}

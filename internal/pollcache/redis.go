@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -23,29 +24,35 @@ func NewRedisStore(client redis.UniversalClient) *RedisStore {
 	return &RedisStore{client: client}
 }
 
-func (s *RedisStore) Get(ctx context.Context, pollID string) (Entry, bool, error) {
+func (s *RedisStore) Get(ctx context.Context, pollID string) (*Entry, error) {
 	raw, err := s.client.Get(ctx, keyPrefix+pollID).Bytes()
 	if errors.Is(err, redis.Nil) {
-		return Entry{}, false, nil
+		return nil, nil
 	}
 	if err != nil {
-		return Entry{}, false, err
+		return nil, fmt.Errorf("poll cache get: %w", err)
 	}
 	var entry Entry
 	if err := json.Unmarshal(raw, &entry); err != nil {
-		return Entry{}, false, nil
+		return nil, nil
 	}
-	return entry, true, nil
+	return &entry, nil
 }
 
 func (s *RedisStore) Set(ctx context.Context, pollID string, entry Entry, ttl time.Duration) error {
 	raw, err := json.Marshal(entry)
 	if err != nil {
-		return err
+		return fmt.Errorf("poll cache marshal: %w", err)
 	}
-	return s.client.Set(ctx, keyPrefix+pollID, raw, ttl).Err()
+	if err := s.client.Set(ctx, keyPrefix+pollID, raw, ttl).Err(); err != nil {
+		return fmt.Errorf("poll cache set: %w", err)
+	}
+	return nil
 }
 
 func (s *RedisStore) Delete(ctx context.Context, pollID string) error {
-	return s.client.Del(ctx, keyPrefix+pollID).Err()
+	if err := s.client.Del(ctx, keyPrefix+pollID).Err(); err != nil {
+		return fmt.Errorf("poll cache delete: %w", err)
+	}
+	return nil
 }

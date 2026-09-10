@@ -62,7 +62,7 @@ func (s *Store) Guard(ctx context.Context, req usecase.GuardRequest) (usecase.Ve
 }
 
 // CastBallot deduplicates the voter and increments selected options.
-func (s *Store) CastBallot(ctx context.Context, ballot usecase.Ballot) (bool, error) {
+func (s *Store) CastBallot(ctx context.Context, ballot usecase.Ballot) error {
 	tag := s.shardTag(ballot.PollID, ballot.VoterHash)
 	keys := []string{tag + ":voted:" + ballot.VoterHash, tag + ":counts"}
 
@@ -74,9 +74,12 @@ func (s *Store) CastBallot(ctx context.Context, ballot usecase.Ballot) (bool, er
 
 	counted, err := castBallotScript.Run(ctx, s.client, keys, args...).Int()
 	if err != nil {
-		return false, entity.WrapError(entity.CodeUnavailable, err, "voting is temporarily unavailable")
+		return fmt.Errorf("cast ballot: %w", entity.WrapError(entity.CodeUnavailable, err, "voting is temporarily unavailable"))
 	}
-	return counted == 1, nil
+	if counted != 1 {
+		return entity.NewError(entity.CodeAlreadyVoted, "this device has already voted in this poll")
+	}
+	return nil
 }
 
 // Counters sums each option across all shards of the poll.

@@ -3,20 +3,36 @@ package usecase
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/LimeOnTop/voting-service/internal/entity"
 )
 
+// ErrNotUpdated means a conditional write matched no rows.
+var ErrNotUpdated = errors.New("not updated")
+
 // PollRepository is the durable store for polls and aggregated results.
 type PollRepository interface {
-	CreatePoll(ctx context.Context, poll entity.Poll) error
+	BeginTx(ctx context.Context) (PollTx, error)
 	GetPoll(ctx context.Context, pollID string) (entity.Poll, error)
-	ListPolls(ctx context.Context, limit, offset int) ([]entity.Poll, int, error)
-	TransitionStatus(ctx context.Context, pollID string, from []entity.PollStatus, to entity.PollStatus, at time.Time) (entity.Poll, error)
+	CountPolls(ctx context.Context) (int, error)
+	ListPollPage(ctx context.Context, limit, offset int) ([]entity.Poll, error)
+	ListOptionsByPollIDs(ctx context.Context, pollIDs []string) (map[string][]entity.Option, error)
+	UpdatePollStatus(ctx context.Context, pollID string, from []entity.PollStatus, to entity.PollStatus, at time.Time) error
+	GetPollStatus(ctx context.Context, pollID string) (entity.PollStatus, error)
 	GetResults(ctx context.Context, pollID string) (map[string]int64, error)
 	SaveResults(ctx context.Context, pollID string, counts map[string]int64) error
 	Ping(ctx context.Context) error
+}
+
+// PollTx groups single-statement writes in one database transaction.
+type PollTx interface {
+	InsertPoll(ctx context.Context, poll entity.Poll) error
+	InsertPollOptions(ctx context.Context, poll entity.Poll) error
+	InsertZeroResults(ctx context.Context, poll entity.Poll) error
+	Commit(ctx context.Context) error
+	Rollback(ctx context.Context) error
 }
 
 // GuardRequest describes abuse checks applied before accepting a ballot.
@@ -44,7 +60,7 @@ type Ballot struct {
 // VoteStore is the Redis hot path for guards, ballots, and counters.
 type VoteStore interface {
 	Guard(ctx context.Context, req GuardRequest) (Verdict, error)
-	CastBallot(ctx context.Context, ballot Ballot) (bool, error)
+	CastBallot(ctx context.Context, ballot Ballot) error
 	Counters(ctx context.Context, pollID string, optionIDs []string) (map[string]int64, error)
 	TrackPoll(ctx context.Context, pollID string) error
 	TrackedPolls(ctx context.Context) ([]string, error)

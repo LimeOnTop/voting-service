@@ -3,6 +3,7 @@ package pollcache
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -19,7 +20,7 @@ type Entry struct {
 
 // SharedStore is the cross-replica cache tier.
 type SharedStore interface {
-	Get(ctx context.Context, pollID string) (Entry, bool, error)
+	Get(ctx context.Context, pollID string) (*Entry, error)
 	Set(ctx context.Context, pollID string, entry Entry, ttl time.Duration) error
 	Delete(ctx context.Context, pollID string) error
 }
@@ -81,12 +82,12 @@ func (c *Cache) resolve(ctx context.Context, pollID string) (Entry, error) {
 		return entry, nil
 	}
 
-	if entry, ok, err := c.shared.Get(ctx, pollID); err != nil {
+	if entry, err := c.shared.Get(ctx, pollID); err != nil {
 		c.log.WarnContext(ctx, "poll cache read failed, falling back to origin",
 			"poll_id", pollID, "error", err.Error())
-	} else if ok {
-		c.local.Set(pollID, entry, c.localTTLFor(entry))
-		return entry, nil
+	} else if entry != nil {
+		c.local.Set(pollID, *entry, c.localTTLFor(*entry))
+		return *entry, nil
 	}
 
 	poll, err := c.origin.GetPoll(ctx, pollID)
@@ -113,7 +114,7 @@ func (c *Cache) store(ctx context.Context, pollID string, entry Entry, sharedTTL
 func (c *Cache) Invalidate(ctx context.Context, pollID string) error {
 	c.local.Delete(pollID)
 	if err := c.shared.Delete(ctx, pollID); err != nil {
-		return entity.WrapError(entity.CodeUnavailable, err, "failed to invalidate poll cache")
+		return fmt.Errorf("invalidate poll cache: %w", entity.WrapError(entity.CodeUnavailable, err, "failed to invalidate poll cache"))
 	}
 	return nil
 }

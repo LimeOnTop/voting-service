@@ -40,7 +40,7 @@ type Report struct {
 func (s *SyncService) Sync(ctx context.Context) (Report, error) {
 	pollIDs, err := s.store.TrackedPolls(ctx)
 	if err != nil {
-		return Report{}, err
+		return Report{}, fmt.Errorf("sync: %w", err)
 	}
 
 	report := Report{Tracked: len(pollIDs)}
@@ -61,21 +61,26 @@ func (s *SyncService) syncPoll(ctx context.Context, pollID string) error {
 	poll, err := s.repo.GetPoll(ctx, pollID)
 	if err != nil {
 		if entity.CodeOf(err) == entity.CodeNotFound {
-			return s.store.UntrackPoll(ctx, pollID)
+			if untrackErr := s.store.UntrackPoll(ctx, pollID); untrackErr != nil {
+				return fmt.Errorf("untrack missing poll: %w", untrackErr)
+			}
+			return nil
 		}
-		return err
+		return fmt.Errorf("sync poll %s: %w", pollID, err)
 	}
 
 	counts, err := s.store.Counters(ctx, pollID, poll.OptionIDs())
 	if err != nil {
-		return err
+		return fmt.Errorf("sync poll %s: %w", pollID, err)
 	}
 	if err := s.repo.SaveResults(ctx, pollID, counts); err != nil {
-		return err
+		return fmt.Errorf("sync poll %s: %w", pollID, err)
 	}
 
 	if s.settled(poll) {
-		return s.store.UntrackPoll(ctx, pollID)
+		if err := s.store.UntrackPoll(ctx, pollID); err != nil {
+			return fmt.Errorf("untrack settled poll: %w", err)
+		}
 	}
 	return nil
 }

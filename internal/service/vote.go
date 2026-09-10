@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"time"
 
@@ -46,18 +47,18 @@ func (s *VoteService) Cast(ctx context.Context, cmd VoteCommand) error {
 
 	poll, err := s.polls.Poll(ctx, cmd.PollID)
 	if err != nil {
-		return err
+		return fmt.Errorf("cast vote: %w", err)
 	}
 	if err := poll.CheckOpenAt(s.now().UTC()); err != nil {
-		return err
+		return fmt.Errorf("cast vote: %w", err)
 	}
 	if err := poll.ValidateBallot(cmd.OptionIDs); err != nil {
-		return err
+		return fmt.Errorf("cast vote: %w", err)
 	}
 
 	verdict, err := s.store.Guard(ctx, usecase.GuardRequest{ClientIP: cmd.ClientIP, PollID: cmd.PollID})
 	if err != nil {
-		return err
+		return fmt.Errorf("cast vote: %w", err)
 	}
 	switch verdict {
 	case usecase.VerdictRateLimited:
@@ -67,16 +68,12 @@ func (s *VoteService) Cast(ctx context.Context, cmd VoteCommand) error {
 	case usecase.VerdictAllow:
 	}
 
-	counted, err := s.store.CastBallot(ctx, usecase.Ballot{
+	if err := s.store.CastBallot(ctx, usecase.Ballot{
 		PollID:    cmd.PollID,
 		VoterHash: VoterHash(cmd.PollID, cmd.VoterToken),
 		OptionIDs: cmd.OptionIDs,
-	})
-	if err != nil {
-		return err
-	}
-	if !counted {
-		return entity.NewError(entity.CodeAlreadyVoted, "this device has already voted in this poll")
+	}); err != nil {
+		return fmt.Errorf("cast vote: %w", err)
 	}
 	return nil
 }
