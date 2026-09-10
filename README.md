@@ -138,12 +138,3 @@ Template: [env.example](env.example). Do not commit `.env`.
 | `make sync-once` | one Redis→Postgres sync |
 | `make test` | `go test ./...` |
 | `make lint` | `go vet ./...` |
-
-## Layout
-
-```text
-cmd/api, cmd/worker
-internal/controller, usecase, service, repository, middleware, entity
-internal/votestore, pollcache, ttlcache, syncjob, httpjson, clients, health, config
-migrations/, api/openapi.yaml
-```
