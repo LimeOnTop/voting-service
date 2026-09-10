@@ -1,0 +1,79 @@
+# Shared runtime settings for API and the one-shot sync job.
+x-app-env: &app-env
+  APP_ENV: development
+  HTTP_ADDRESS: ":8080"
+  DATABASE_URL: postgres://voting:voting@postgres:5432/voting?sslmode=disable
+  REDIS_ADDRESSES: redis:6379
+  REDIS_DB: "0"
+  ADMIN_TOKEN: "0123456789abcdef0123456789abcdef"
+  VOTER_COOKIE_NAME: voter_id
+  VOTER_COOKIE_SECURE: "false"
+  SYNC_TIMEOUT: "30s"
+  SYNC_SETTLE_AFTER: "10m"
+
+services:
+  migrate:
+    image: migrate/migrate:v4.18.3
+    volumes:
+      - ./migrations:/migrations:ro
+    entrypoint:
+      - migrate
+      - -path=/migrations
+      - -database=postgres://voting:voting@postgres:5432/voting?sslmode=disable&x-migrations-table=voting_schema_migrations
+      - up
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build: .
+    ports:
+      - "8081:8080"
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  # Local stand-in for Kubernetes CronJob: run voting-sync every SYNC_CRON_SECONDS.
+  # In cluster use deploy/k8s/sync-cronjob.yaml instead (concurrencyPolicy: Forbid).
+  sync:
+    build: .
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        echo "sync scheduler started (every $${SYNC_CRON_SECONDS:-60}s)"
+        while true; do
+          ./voting-sync || echo "sync job failed"
+          sleep "$${SYNC_CRON_SECONDS:-60}"
+        done
+    environment:
+      <<: *app-env
+      SYNC_CRON_SECONDS: "60"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: voting
+      POSTGRES_PASSWORD: voting
+      POSTGRES_DB: voting
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U voting -d voting"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"

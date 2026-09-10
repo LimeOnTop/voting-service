@@ -1,0 +1,385 @@
+openapi: 3.0.3
+info:
+  title: Voting Service API
+  version: 1.0.0
+  description: |
+    High-load anonymous survey voting API with Redis deduplication and async
+    aggregation to PostgreSQL. Votes are accepted on the Redis hot path;
+    `voting-sync` persists absolute counters periodically.
+servers:
+  - url: http://localhost:8081
+    description: Docker Compose published API port
+  - url: http://localhost:8080
+    description: Default HTTP_ADDRESS when running `make run-api` locally
+paths:
+  /health/live:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      responses:
+        '200':
+          description: Process is alive
+  /health/ready:
+    get:
+      tags: [health]
+      summary: Readiness probe (Postgres + Redis)
+      responses:
+        '200':
+          description: Dependencies are healthy
+        '503':
+          description: Dependency unavailable
+  /api/v1/polls/{poll_id}:
+    get:
+      tags: [public]
+      summary: Get poll question and options (no vote counts)
+      parameters:
+        - $ref: '#/components/parameters/PollId'
+      responses:
+        '200':
+          description: Poll
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Poll'
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/polls/{poll_id}/votes:
+    post:
+      tags: [public]
+      summary: Cast a vote
+      description: |
+        Issues an HttpOnly `voter_id` cookie when absent. Deduplication is
+        per poll and cookie token (`SHA256(poll_id + token)`), not per IP.
+      parameters:
+        - $ref: '#/components/parameters/PollId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VoteRequest'
+      responses:
+        '201':
+          description: Vote accepted
+          headers:
+            Set-Cookie:
+              description: Set when the client had no valid voter cookie
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VoteResponse'
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+        '409':
+          $ref: '#/components/responses/Error'
+        '429':
+          $ref: '#/components/responses/Error'
+        '503':
+          $ref: '#/components/responses/Error'
+  /api/v1/admin/polls:
+    get:
+      tags: [admin]
+      summary: List polls
+      security:
+        - AdminBearer: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+            minimum: 0
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+      responses:
+        '200':
+          description: Paginated list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PollList'
+        '401':
+          $ref: '#/components/responses/Error'
+    post:
+      tags: [admin]
+      summary: Create poll (draft)
+      security:
+        - AdminBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePollRequest'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Poll'
+        '400':
+          $ref: '#/components/responses/Error'
+        '401':
+          $ref: '#/components/responses/Error'
+  /api/v1/admin/polls/{poll_id}/activate:
+    post:
+      tags: [admin]
+      summary: Activate poll
+      security:
+        - AdminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/PollId'
+      responses:
+        '200':
+          description: Activated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Poll'
+        '401':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+        '409':
+          $ref: '#/components/responses/Error'
+  /api/v1/admin/polls/{poll_id}/finish:
+    post:
+      tags: [admin]
+      summary: Finish poll
+      security:
+        - AdminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/PollId'
+      responses:
+        '200':
+          description: Finished
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Poll'
+        '401':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+        '409':
+          $ref: '#/components/responses/Error'
+  /api/v1/admin/polls/{poll_id}/results:
+    get:
+      tags: [admin]
+      summary: Aggregated results (max of live Redis and durable Postgres)
+      security:
+        - AdminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/PollId'
+      responses:
+        '200':
+          description: Results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Results'
+        '401':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+        '503':
+          $ref: '#/components/responses/Error'
+components:
+  securitySchemes:
+    AdminBearer:
+      type: http
+      scheme: bearer
+      description: Value of ADMIN_TOKEN (minimum 32 characters)
+  parameters:
+    PollId:
+      name: poll_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - invalid_request
+                - unauthorized
+                - not_found
+                - conflict
+                - already_voted
+                - payload_too_large
+                - rate_limited
+                - quota_exceeded
+                - unavailable
+                - internal
+            message:
+              type: string
+    Option:
+      type: object
+      required: [id, text, position]
+      properties:
+        id:
+          type: string
+          format: uuid
+        text:
+          type: string
+        position:
+          type: integer
+    Poll:
+      type: object
+      required: [id, question, type, max_choices, status, options, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        question:
+          type: string
+        type:
+          type: string
+          enum: [single, multiple]
+        max_choices:
+          type: integer
+          minimum: 1
+        status:
+          type: string
+          enum: [draft, active, finished]
+        options:
+          type: array
+          items:
+            $ref: '#/components/schemas/Option'
+        created_at:
+          type: string
+          format: date-time
+        starts_at:
+          type: string
+          format: date-time
+          nullable: true
+        ends_at:
+          type: string
+          format: date-time
+          nullable: true
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+    PollList:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Poll'
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
+    CreatePollRequest:
+      type: object
+      required: [question, options]
+      properties:
+        question:
+          type: string
+        type:
+          type: string
+          enum: [single, multiple]
+          default: single
+        max_choices:
+          type: integer
+          minimum: 1
+          description: |
+            Forced to 1 for single. For multiple, defaults to the number of
+            options when omitted.
+        options:
+          type: array
+          items:
+            type: string
+          minItems: 2
+        starts_at:
+          type: string
+          format: date-time
+        ends_at:
+          type: string
+          format: date-time
+    VoteRequest:
+      type: object
+      required: [option_ids]
+      properties:
+        option_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          minItems: 1
+          description: One id for single-choice polls; up to max_choices for multiple
+    VoteResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [accepted]
+    OptionResult:
+      type: object
+      required: [id, text, votes, percentage]
+      properties:
+        id:
+          type: string
+          format: uuid
+        text:
+          type: string
+        votes:
+          type: integer
+          format: int64
+        percentage:
+          type: number
+          description: Share of total_votes, rounded to two decimal places
+    Results:
+      type: object
+      required: [poll_id, question, status, total_votes, options, generated_at]
+      properties:
+        poll_id:
+          type: string
+          format: uuid
+        question:
+          type: string
+        status:
+          type: string
+          enum: [draft, active, finished]
+        total_votes:
+          type: integer
+          format: int64
+          description: Sum of option selections (for multiple-choice can exceed ballot count)
+        options:
+          type: array
+          items:
+            $ref: '#/components/schemas/OptionResult'
+        generated_at:
+          type: string
+          format: date-time
