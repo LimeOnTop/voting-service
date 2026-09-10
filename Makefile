@@ -18,7 +18,7 @@ migrate:
 	docker compose up -d postgres
 	docker compose run --rm migrate
 
-# One-shot sync (same as a CronJob tick).
+# One-shot Redis → PostgreSQL sync.
 sync-once:
 	go run ./cmd/worker
 

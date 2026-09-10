@@ -37,8 +37,7 @@ services:
       redis:
         condition: service_started
 
-  # Local stand-in for Kubernetes CronJob: run voting-sync every SYNC_CRON_SECONDS.
-  # In cluster use deploy/k8s/sync-cronjob.yaml instead (concurrencyPolicy: Forbid).
+  # Local stand-in for a periodic sync job (one-shot voting-sync in a loop).
   sync:
     build: .
     entrypoint: ["/bin/sh", "-c"]
